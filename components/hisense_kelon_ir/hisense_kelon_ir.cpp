@@ -140,10 +140,10 @@ void HisenseKelonIRClimate::transmit_state() {
 }
 
 void HisenseKelonIRClimate::send_follow_me(float temperature, bool enabled) {
-  if (this->mode == climate::CLIMATE_MODE_OFF) {
-    ESP_LOGD(TAG, "Skipping follow-me command because climate is off");
-    return;
-  }
+  // TEMPORARY TEST PATCH:
+  // Allow sending follow-me/iFeel even when ESPHome climate entity is OFF.
+  // This is useful when the physical AC is already on, but ESPHome has not
+  // synchronized its climate state yet. Restore the guard after testing if needed.
 
   if (!std::isfinite(temperature)) {
     ESP_LOGW(TAG, "Skipping follow-me command because temperature is unavailable");
