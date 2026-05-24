@@ -145,16 +145,21 @@ void HisenseKelonIRClimate::send_follow_me(float temperature, bool enabled) {
   // This is useful when the physical AC is already on, but ESPHome has not
   // synchronized its climate state yet. Restore the guard after testing if needed.
 
-  if (!std::isfinite(temperature)) {
+  // Turning iFeel OFF does not need a valid temperature: the frame must carry
+  // byte 11 = 0x00 and byte 12 = 0x00. Require temperature only when enabling
+  // or updating iFeel.
+  if (enabled && !std::isfinite(temperature)) {
     ESP_LOGW(TAG, "Skipping follow-me command because temperature is unavailable");
     return;
   }
 
   const bool state_changed = this->follow_me_enabled_ != enabled;
   this->follow_me_enabled_ = enabled;
-  this->follow_me_temperature_ = static_cast<uint8_t>(lroundf(clamp(temperature, 0.0f, 50.0f)));
+  this->follow_me_temperature_ = enabled ? static_cast<uint8_t>(lroundf(clamp(temperature, 0.0f, 50.0f))) : 0;
 
-  if (state_changed) {
+  // Always send the OFF frame when enabled=false. Otherwise a forced OFF button
+  // would do nothing if ESPHome missed the earlier ON state or rebooted.
+  if (state_changed || !enabled) {
     auto data = this->build_follow_me_state_(this->follow_me_temperature_, enabled, false);
     this->transmit_kelon_(data, false);
   }
