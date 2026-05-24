@@ -13,6 +13,11 @@ DEPENDENCIES = ["remote_transmitter"]
 CONF_ENABLED = "enabled"
 CONF_ENSURE_POWER = "ensure_power"
 CONF_ENSURE_POWER_ON_BOOT = "ensure_power_on_boot"
+CONF_TARGET_TEMPERATURE = "target_temperature"
+CONF_MODE = "mode"
+CONF_FAN_MODE = "fan_mode"
+CONF_SWING_MODE = "swing_mode"
+CONF_PRESET_MODE = "preset_mode"
 
 EnsurePowerMode = hisense_kelon_ir_ns.enum("EnsurePowerMode")
 ENSURE_POWER_MODES = {
@@ -25,6 +30,9 @@ HisenseKelonIRClimate = hisense_kelon_ir_ns.class_(
     "HisenseKelonIRClimate", climate_ir.ClimateIR
 )
 FollowMeAction = hisense_kelon_ir_ns.class_("FollowMeAction", automation.Action)
+FollowMeFromHomeAssistantStateAction = hisense_kelon_ir_ns.class_(
+    "FollowMeFromHomeAssistantStateAction", automation.Action
+)
 DisplayOffAction = hisense_kelon_ir_ns.class_("DisplayOffAction", automation.Action)
 Kelon168Dumper = hisense_kelon_ir_ns.class_(
     "Kelon168Dumper", remote_base.RemoteReceiverDumperBase
@@ -73,6 +81,46 @@ async def follow_me_to_code(config, action_id, template_arg, args):
     cg.add(var.set_temperature(template_))
     template_ = await cg.templatable(config[CONF_ENABLED], args, bool)
     cg.add(var.set_enabled(template_))
+    return var
+
+
+FOLLOW_ME_HA_STATE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ID): cv.use_id(HisenseKelonIRClimate),
+        cv.Required(CONF_TEMPERATURE): cv.templatable(cv.float_),
+        cv.Optional(CONF_ENABLED, default=True): cv.templatable(cv.boolean),
+        cv.Required(CONF_MODE): cv.templatable(cv.string),
+        cv.Required(CONF_TARGET_TEMPERATURE): cv.templatable(cv.float_),
+        cv.Optional(CONF_FAN_MODE, default=""): cv.templatable(cv.string),
+        cv.Optional(CONF_SWING_MODE, default=""): cv.templatable(cv.string),
+        cv.Optional(CONF_PRESET_MODE, default=""): cv.templatable(cv.string),
+    }
+)
+
+
+@automation.register_action(
+    "hisense_kelon_ir.follow_me_from_homeassistant_state",
+    FollowMeFromHomeAssistantStateAction,
+    FOLLOW_ME_HA_STATE_SCHEMA,
+    synchronous=True,
+)
+async def follow_me_from_homeassistant_state_to_code(config, action_id, template_arg, args):
+    parent = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, parent)
+    template_ = await cg.templatable(config[CONF_TEMPERATURE], args, cg.float_)
+    cg.add(var.set_temperature(template_))
+    template_ = await cg.templatable(config[CONF_ENABLED], args, bool)
+    cg.add(var.set_enabled(template_))
+    template_ = await cg.templatable(config[CONF_MODE], args, cg.std_string)
+    cg.add(var.set_mode(template_))
+    template_ = await cg.templatable(config[CONF_TARGET_TEMPERATURE], args, cg.float_)
+    cg.add(var.set_target_temperature(template_))
+    template_ = await cg.templatable(config[CONF_FAN_MODE], args, cg.std_string)
+    cg.add(var.set_fan_mode(template_))
+    template_ = await cg.templatable(config[CONF_SWING_MODE], args, cg.std_string)
+    cg.add(var.set_swing_mode(template_))
+    template_ = await cg.templatable(config[CONF_PRESET_MODE], args, cg.std_string)
+    cg.add(var.set_preset_mode(template_))
     return var
 
 

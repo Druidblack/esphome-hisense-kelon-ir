@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <inttypes.h>
+#include <string>
 
 #include "esphome/core/log.h"
 
@@ -157,16 +158,61 @@ void HisenseKelonIRClimate::send_follow_me(float temperature, bool enabled) {
   this->follow_me_enabled_ = enabled;
   this->follow_me_temperature_ = enabled ? static_cast<uint8_t>(lroundf(clamp(temperature, 0.0f, 50.0f))) : 0;
 
-  // Always send the OFF frame when enabled=false. Otherwise a forced OFF button
-  // would do nothing if ESPHome missed the earlier ON state or rebooted.
+  // If the enable state changes, send the real iFeel command (0x0D): this is
+  // what the original remote uses for ON/OFF. If iFeel is already ON, send only
+  // the periodic temperature update frame (0x00), preserving all climate bytes.
   if (state_changed || !enabled) {
     auto data = this->build_follow_me_state_(this->follow_me_temperature_, enabled, false);
     this->transmit_kelon_(data, false);
-  }
-  if (enabled) {
+  } else if (enabled) {
     auto data = this->build_follow_me_state_(this->follow_me_temperature_, true, true);
     this->transmit_kelon_(data, false);
   }
+}
+
+void HisenseKelonIRClimate::send_follow_me_from_homeassistant(float temperature, bool enabled, const std::string &mode,
+                                                              float target_temperature, const std::string &fan_mode,
+                                                              const std::string &swing_mode,
+                                                              const std::string &preset_mode) {
+  // This action is intended for setups where another HA climate entity is the
+  // source of truth (for example a UART/USB/Wi-Fi integration that knows the
+  // real AC state). The iFeel IR frame is built from that HA climate state so
+  // only the follow-me bytes and checksums change during transmission.
+  if (enabled && !std::isfinite(temperature)) {
+    ESP_LOGW(TAG, "Skipping HA-state follow-me command because iFeel temperature is unavailable");
+    return;
+  }
+
+  climate::ClimateMode parsed_mode;
+  if (!this->parse_ha_mode_(mode, &parsed_mode)) {
+    ESP_LOGW(TAG, "Skipping HA-state follow-me command because HA climate mode is '%s'", mode.c_str());
+    return;
+  }
+
+  const float safe_target_temperature = std::isfinite(target_temperature) ? target_temperature : this->target_temperature;
+  if (!std::isfinite(safe_target_temperature)) {
+    ESP_LOGW(TAG, "Skipping HA-state follow-me command because target temperature is unavailable");
+    return;
+  }
+
+  const auto parsed_fan = this->parse_ha_fan_(fan_mode, this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO));
+  const auto parsed_swing = this->parse_ha_swing_(swing_mode, this->swing_mode);
+  const auto parsed_preset = this->parse_ha_preset_(preset_mode, this->preset.value_or(climate::CLIMATE_PRESET_NONE));
+
+  const bool state_changed = this->follow_me_enabled_ != enabled;
+  this->follow_me_enabled_ = enabled;
+  this->follow_me_temperature_ = enabled ? static_cast<uint8_t>(lroundf(clamp(temperature, 0.0f, 50.0f))) : 0;
+  const bool update = enabled && !state_changed;
+
+  ESP_LOGI(TAG,
+           "Building iFeel from HA climate state: mode=%s target=%.1f fan=%s swing=%s preset=%s ifeel=%u enabled=%s",
+           mode.c_str(), safe_target_temperature, fan_mode.c_str(), swing_mode.c_str(), preset_mode.c_str(),
+           this->follow_me_temperature_, YESNO(enabled));
+
+  auto data = this->build_follow_me_state_from_homeassistant_(this->follow_me_temperature_, enabled, update, parsed_mode,
+                                                              safe_target_temperature, parsed_fan, parsed_swing,
+                                                              parsed_preset);
+  this->transmit_kelon_(data, false);
 }
 
 void HisenseKelonIRClimate::send_display_off() {
@@ -196,6 +242,13 @@ void HisenseKelonIRClimate::apply_received_state_(const Kelon168Data &data) {
       this->follow_me_enabled_ = (data.state[11] & KELON168_FOLLOW_ME_ENABLED) != 0;
       this->follow_me_temperature_ = data.state[12];
     }
+
+    // Keep the full frame as the latest known AC state. Kelon168 is a full-state
+    // IR protocol, so future iFeel commands must reuse the current mode, target
+    // temperature, fan, swing, etc. and change only bytes 11/12 plus command/checksums.
+    this->last_tx_ = data;
+    this->have_last_tx_ = true;
+
     ESP_LOGD(TAG, "Ignoring non-climate Kelon168 command 0x%02X for climate state", command);
     return;
   }
@@ -275,10 +328,56 @@ Kelon168Data HisenseKelonIRClimate::build_state_(climate::ClimateMode mode, floa
 }
 
 Kelon168Data HisenseKelonIRClimate::build_follow_me_state_(uint8_t temperature, bool enabled, bool update) const {
-  auto data = Kelon168Protocol::make_default();
-  data.state[3] = (KELON168_MODE_COOL & 0x07) | ((24 - 16) << 4);
-  data.state[6] = update ? 0x08 : 0x87;
-  data.state[7] = update ? 0x03 : 0x3B;
+  // Kelon168 frames contain the whole AC state, not only the changed setting.
+  // Therefore follow-me/iFeel must be based on the latest known full frame;
+  // otherwise hardcoded defaults can unintentionally change target temp, mode,
+  // fan speed, swing, etc. when the iFeel command is sent.
+  auto data = this->have_last_tx_
+                  ? this->last_tx_
+                  : this->build_state_(this->mode, this->target_temperature,
+                                       this->fan_mode.value_or(climate::CLIMATE_FAN_AUTO), this->swing_mode,
+                                       this->preset.value_or(climate::CLIMATE_PRESET_NONE), false,
+                                       update ? KELON168_COMMAND_LIGHT : KELON168_COMMAND_IFEEL);
+
+  data.state[11] = enabled ? KELON168_FOLLOW_ME_ENABLED : 0x00;
+  data.state[12] = enabled ? temperature : 0x00;
+  data.state[15] = update ? KELON168_COMMAND_LIGHT : KELON168_COMMAND_IFEEL;
+  Kelon168Protocol::checksum(&data);
+  return data;
+}
+
+Kelon168Data HisenseKelonIRClimate::build_follow_me_state_from_homeassistant_(
+    uint8_t temperature, bool enabled, bool update, climate::ClimateMode mode, float target_temperature,
+    climate::ClimateFanMode fan_mode, climate::ClimateSwingMode swing_mode, climate::ClimatePreset preset) const {
+  // Start with the latest full frame when possible, because Kelon168 frames may
+  // contain model-specific bits that are not represented by ESPHome Climate. Then
+  // overlay the HA climate values that we do know, and finally change only iFeel.
+  auto data = this->have_last_tx_ ? this->last_tx_ : Kelon168Protocol::make_default();
+  const uint8_t native_mode = this->encode_mode_(mode);
+  const uint8_t temp = static_cast<uint8_t>(lroundf(clamp(target_temperature, 16.0f, 32.0f)));
+
+  // Clear only the bits controlled by this component, preserving unknown bytes/bits
+  // from the last real frame as much as possible.
+  data.state[2] &= static_cast<uint8_t>(~(0x04 | 0x08 | 0x80 | 0x03));  // power toggle, sleep, V swing, fan bits
+  data.state[5] &= static_cast<uint8_t>(~0x90);                        // boost bits
+  data.state[8] &= static_cast<uint8_t>(~(0x40 | 0x80));                // V/H swing bits
+  data.state[17] &= static_cast<uint8_t>(~0x40);                       // low-fan helper bit
+
+  if (preset == climate::CLIMATE_PRESET_SLEEP)
+    data.state[2] |= 0x08;
+  if (preset == climate::CLIMATE_PRESET_BOOST)
+    data.state[5] |= 0x90;
+
+  if (swing_mode == climate::CLIMATE_SWING_VERTICAL || swing_mode == climate::CLIMATE_SWING_BOTH) {
+    data.state[2] |= 0x80;
+    data.state[8] |= 0x40;
+  }
+  if (swing_mode == climate::CLIMATE_SWING_HORIZONTAL || swing_mode == climate::CLIMATE_SWING_BOTH)
+    data.state[8] |= 0x80;
+
+  this->set_fan_(&data, fan_mode);
+  data.state[3] = (native_mode & 0x07) | ((temp - 16) << 4);
+
   data.state[11] = enabled ? KELON168_FOLLOW_ME_ENABLED : 0x00;
   data.state[12] = enabled ? temperature : 0x00;
   data.state[15] = update ? KELON168_COMMAND_LIGHT : KELON168_COMMAND_IFEEL;
@@ -373,6 +472,69 @@ climate::ClimateFanMode HisenseKelonIRClimate::decode_fan_(const Kelon168Data &d
   if (fan == 0x01)
     return climate::CLIMATE_FAN_HIGH;
   return climate::CLIMATE_FAN_AUTO;
+}
+
+bool HisenseKelonIRClimate::parse_ha_mode_(const std::string &mode, climate::ClimateMode *out) const {
+  if (mode == "heat") {
+    *out = climate::CLIMATE_MODE_HEAT;
+    return true;
+  }
+  if (mode == "cool") {
+    *out = climate::CLIMATE_MODE_COOL;
+    return true;
+  }
+  if (mode == "dry") {
+    *out = climate::CLIMATE_MODE_DRY;
+    return true;
+  }
+  if (mode == "fan_only") {
+    *out = climate::CLIMATE_MODE_FAN_ONLY;
+    return true;
+  }
+  if (mode == "heat_cool" || mode == "auto") {
+    *out = climate::CLIMATE_MODE_HEAT_COOL;
+    return true;
+  }
+  // Do not build an iFeel frame from 'off', 'unknown' or 'unavailable': that
+  // would otherwise fall back to AUTO and could unintentionally change the AC.
+  return false;
+}
+
+climate::ClimateFanMode HisenseKelonIRClimate::parse_ha_fan_(const std::string &fan_mode,
+                                                             climate::ClimateFanMode fallback) const {
+  if (fan_mode == "auto")
+    return climate::CLIMATE_FAN_AUTO;
+  if (fan_mode == "low")
+    return climate::CLIMATE_FAN_LOW;
+  if (fan_mode == "medium")
+    return climate::CLIMATE_FAN_MEDIUM;
+  if (fan_mode == "high")
+    return climate::CLIMATE_FAN_HIGH;
+  return fallback;
+}
+
+climate::ClimateSwingMode HisenseKelonIRClimate::parse_ha_swing_(const std::string &swing_mode,
+                                                                 climate::ClimateSwingMode fallback) const {
+  if (swing_mode == "off")
+    return climate::CLIMATE_SWING_OFF;
+  if (swing_mode == "vertical")
+    return climate::CLIMATE_SWING_VERTICAL;
+  if (swing_mode == "horizontal")
+    return climate::CLIMATE_SWING_HORIZONTAL;
+  if (swing_mode == "both")
+    return climate::CLIMATE_SWING_BOTH;
+  return fallback;
+}
+
+climate::ClimatePreset HisenseKelonIRClimate::parse_ha_preset_(const std::string &preset_mode,
+                                                               climate::ClimatePreset fallback) const {
+  if (preset_mode.empty() || preset_mode == "none")
+    return climate::CLIMATE_PRESET_NONE;
+  if (preset_mode == "sleep")
+    return climate::CLIMATE_PRESET_SLEEP;
+  if (preset_mode == "boost")
+    return climate::CLIMATE_PRESET_BOOST;
+  return fallback;
 }
 
 void HisenseKelonIRClimate::log_changed_bytes_(const Kelon168Data &data) const {

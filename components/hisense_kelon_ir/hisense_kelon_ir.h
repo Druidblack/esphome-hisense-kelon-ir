@@ -5,6 +5,8 @@
 #include "esphome/core/helpers.h"
 #include "kelon168_protocol.h"
 
+#include <string>
+
 namespace esphome {
 namespace hisense_kelon_ir {
 
@@ -31,6 +33,9 @@ class HisenseKelonIRClimate : public climate_ir::ClimateIR {
   void set_ensure_power_on_boot(bool ensure_power_on_boot) { this->ensure_power_on_boot_ = ensure_power_on_boot; }
 
   void send_follow_me(float temperature, bool enabled);
+  void send_follow_me_from_homeassistant(float temperature, bool enabled, const std::string &mode,
+                                        float target_temperature, const std::string &fan_mode,
+                                        const std::string &swing_mode, const std::string &preset_mode);
   void send_display_off();
 
  protected:
@@ -42,6 +47,11 @@ class HisenseKelonIRClimate : public climate_ir::ClimateIR {
                             climate::ClimateFanMode fan_mode, climate::ClimateSwingMode swing_mode,
                             climate::ClimatePreset preset, bool power_toggle, uint8_t command) const;
   Kelon168Data build_follow_me_state_(uint8_t temperature, bool enabled, bool update) const;
+  Kelon168Data build_follow_me_state_from_homeassistant_(uint8_t temperature, bool enabled, bool update,
+                                                         climate::ClimateMode mode, float target_temperature,
+                                                         climate::ClimateFanMode fan_mode,
+                                                         climate::ClimateSwingMode swing_mode,
+                                                         climate::ClimatePreset preset) const;
   void transmit_kelon_(Kelon168Data data, bool remember = true);
   void ensure_power_on_();
   void apply_follow_me_(Kelon168Data *data) const;
@@ -50,6 +60,10 @@ class HisenseKelonIRClimate : public climate_ir::ClimateIR {
   climate::ClimateMode decode_mode_(uint8_t mode) const;
   void set_fan_(Kelon168Data *data, climate::ClimateFanMode fan_mode) const;
   climate::ClimateFanMode decode_fan_(const Kelon168Data &data) const;
+  bool parse_ha_mode_(const std::string &mode, climate::ClimateMode *out) const;
+  climate::ClimateFanMode parse_ha_fan_(const std::string &fan_mode, climate::ClimateFanMode fallback) const;
+  climate::ClimateSwingMode parse_ha_swing_(const std::string &swing_mode, climate::ClimateSwingMode fallback) const;
+  climate::ClimatePreset parse_ha_preset_(const std::string &preset_mode, climate::ClimatePreset fallback) const;
   void log_changed_bytes_(const Kelon168Data &data) const;
 
   EnsurePowerMode ensure_power_{ENSURE_POWER_SMART};
@@ -74,6 +88,29 @@ template<typename... Ts> class FollowMeAction : public Action<Ts...> {
  protected:
   void play(const Ts &...x) override {
     this->parent_->send_follow_me(this->temperature_.value(x...), this->enabled_.value_or(x..., true));
+  }
+
+  HisenseKelonIRClimate *parent_;
+};
+
+
+template<typename... Ts> class FollowMeFromHomeAssistantStateAction : public Action<Ts...> {
+ public:
+  explicit FollowMeFromHomeAssistantStateAction(HisenseKelonIRClimate *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(float, temperature)
+  TEMPLATABLE_VALUE(bool, enabled)
+  TEMPLATABLE_VALUE(std::string, mode)
+  TEMPLATABLE_VALUE(float, target_temperature)
+  TEMPLATABLE_VALUE(std::string, fan_mode)
+  TEMPLATABLE_VALUE(std::string, swing_mode)
+  TEMPLATABLE_VALUE(std::string, preset_mode)
+
+ protected:
+  void play(const Ts &...x) override {
+    this->parent_->send_follow_me_from_homeassistant(
+        this->temperature_.value(x...), this->enabled_.value_or(x..., true), this->mode_.value(x...),
+        this->target_temperature_.value(x...), this->fan_mode_.value_or(x..., std::string("")),
+        this->swing_mode_.value_or(x..., std::string("")), this->preset_mode_.value_or(x..., std::string("")));
   }
 
   HisenseKelonIRClimate *parent_;
